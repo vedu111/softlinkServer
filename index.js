@@ -161,52 +161,69 @@ async function findRelevantContent(query, embeddingsDatabase) {
   }
 }
 
-// Function to check if HS code exists in the database and get its export policy
-function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
-  if (embeddingsDatabase.hsCodesData && embeddingsDatabase.hsCodesData[hsCode]) {
-    const hsData = embeddingsDatabase.hsCodesData[hsCode];
+async function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
+    if (embeddingsDatabase.hsCodesData && embeddingsDatabase.hsCodesData[hsCode]) {
+      const hsData = embeddingsDatabase.hsCodesData[hsCode];
+      return {
+        exists: true,
+        allowed: hsData.policy.toLowerCase() === 'free',
+        policy: hsData.policy,
+        description: hsData.description
+      };
+    }
+    
+    if (hsCode.length >= 4) {
+      const chapter = hsCode.substring(0, 4);
+      const twoDigitChapter = hsCode.substring(0, 2);
+      
+      const matchingCodes = Object.keys(embeddingsDatabase.hsCodesData || {})
+        .filter(code => code.startsWith(chapter) || code.startsWith(twoDigitChapter));
+      
+      if (matchingCodes.length > 0) {
+        const policies = matchingCodes.map(code => embeddingsDatabase.hsCodesData[code].policy);
+        
+        if (policies.some(policy => policy.toLowerCase() === 'free')) {
+          return {
+            exists: true,
+            allowed: true,
+            policy: 'Free',
+            description: `Falls under chapter ${chapter} which has some free categories`
+          };
+        } else {
+          return {
+            exists: true,
+            allowed: false,
+            policy: policies[0],
+            description: `Falls under chapter ${chapter} which has no free categories`
+          };
+        }
+      }
+    }
+    
+    // Call to Gemini API for dynamic reasoning
+    const dynamicReason = await generateDynamicReason(hsCode);
+    
     return {
-      exists: true,
-      allowed: hsData.policy.toLowerCase() === 'free',
-      policy: hsData.policy,
-      description: hsData.description
+      exists: false,
+      allowed: false,
+      reason: dynamicReason
     };
   }
   
-  if (hsCode.length >= 4) {
-    const chapter = hsCode.substring(0, 4);
-    const twoDigitChapter = hsCode.substring(0, 2);
+  async function generateDynamicReason(hsCode) {
+    // Example API call to Gemini API
+    const response = await fetch('https://api.gemini.com/generateReason', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ hsCode })
+    });
     
-    const matchingCodes = Object.keys(embeddingsDatabase.hsCodesData || {})
-      .filter(code => code.startsWith(chapter) || code.startsWith(twoDigitChapter));
+    const data = await response.json();3
     
-    if (matchingCodes.length > 0) {
-      const policies = matchingCodes.map(code => embeddingsDatabase.hsCodesData[code].policy);
-      
-      if (policies.some(policy => policy.toLowerCase() === 'free')) {
-        return {
-          exists: true,
-          allowed: true,
-          policy: 'Free',
-          description: `Falls under chapter ${chapter} which has some free categories`
-        };
-      } else {
-        return {
-          exists: true,
-          allowed: false,
-          policy: policies[0],
-          description: `Falls under chapter ${chapter} which has no free categories`
-        };
-      }
-    }
+    return data.reason || `The HS Code ${hsCode} was not found in the export compliance regulations. Please verify the code and try again.`;
   }
-  
-  return {
-    exists: false,
-    allowed: false,
-    reason: `HS Code ${hsCode} not found in export compliance regulations`
-  };
-}
 
 // Helper function to calculate cosine similarity
 function cosineSimilarity(vecA, vecB) {
@@ -241,7 +258,7 @@ app.post('/api/check-export-compliance', async (req, res) => {
       });
     }
     
-    const hsCodeCompliance = checkHSCodeCompliance(hsCode, embeddingsDatabase);
+    const hsCodeCompliance = await checkHSCodeCompliance(hsCode, embeddingsDatabase);
     
     if (!hsCodeCompliance.exists) {
       return res.json({
