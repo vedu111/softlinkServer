@@ -16,7 +16,7 @@ const port = process.env.PORT || 3000;
 app.use(bodyParser.json());
 
 // Set up Gemini API
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyAGwF77rylskhbDu4WLNf0zSWTuVlNbr5A";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "YOUR_API_KEY";
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
@@ -24,11 +24,13 @@ const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
 // Path to the PDF and embeddings file
 const PDF_PATH = path.join(__dirname, 'merged_pdf.pdf');
 const EMBEDDINGS_PATH = path.join(__dirname, 'embeddings-database.json');
+const ITEM_TO_HS_PATH = path.join(__dirname, 'item-to-hs-mapping.json');
 
 // Function to extract HS Codes from PDF content
 function extractHSCodes(pdfText) {
   const hsCodeRegex = /(\d{8})\s+(.*?)(?:\s+)(Free|Restricted|Prohibited|Not Permitted)/gi;
   const hsCodesData = {};
+  const itemToHsMap = {};
   
   let match;
   while ((match = hsCodeRegex.exec(pdfText)) !== null) {
@@ -40,17 +42,30 @@ function extractHSCodes(pdfText) {
       description,
       policy: exportPolicy
     };
+    
+    // Create a mapping from items in description to HS code
+    const items = description.split(/[,;\/]/).map(item => item.trim().toLowerCase());
+    items.forEach(item => {
+      if (item.length > 3) { // Ignore very short terms
+        itemToHsMap[item] = hsCode;
+      }
+    });
+    
+    // Also add the full description as a searchable item
+    itemToHsMap[description.toLowerCase()] = hsCode;
   }
   
-  return hsCodesData;
+  return { hsCodesData, itemToHsMap };
 }
 
 // Function to generate embeddings and extract HS codes from PDF
 async function generatePdfEmbeddings() {
   try {
-    if (fs.existsSync(EMBEDDINGS_PATH)) {
-      console.log('Embeddings file already exists. Using existing embeddings.');
-      return JSON.parse(fs.readFileSync(EMBEDDINGS_PATH, 'utf8'));
+    if (fs.existsSync(EMBEDDINGS_PATH) && fs.existsSync(ITEM_TO_HS_PATH)) {
+      console.log('Embeddings files already exist. Using existing data.');
+      const embeddingsData = JSON.parse(fs.readFileSync(EMBEDDINGS_PATH, 'utf8'));
+      const itemToHsMap = JSON.parse(fs.readFileSync(ITEM_TO_HS_PATH, 'utf8'));
+      return { ...embeddingsData, itemToHsMap };
     }
 
     console.log('Generating embeddings from PDF...');
@@ -59,9 +74,13 @@ async function generatePdfEmbeddings() {
     const pdfData = await pdfParse(dataBuffer);
     const pdfText = pdfData.text;
     
-    console.log('Extracted PDF Text:', pdfText); // Log the extracted text
+    console.log('Extracted PDF Text length:', pdfText.length); 
     
-    const hsCodesData = extractHSCodes(pdfText);
+    const { hsCodesData, itemToHsMap } = extractHSCodes(pdfText);
+    
+    // Save item to HS code mapping
+    fs.writeFileSync(ITEM_TO_HS_PATH, JSON.stringify(itemToHsMap, null, 2));
+    console.log('Item to HS code mapping saved to file.');
     
     const chunkSize = 1000;
     const textChunks = [];
@@ -129,7 +148,7 @@ async function generatePdfEmbeddings() {
     fs.writeFileSync(EMBEDDINGS_PATH, JSON.stringify(embeddingsDatabase, null, 2));
     console.log('Embeddings saved to file.');
     
-    return embeddingsDatabase;
+    return { ...embeddingsDatabase, itemToHsMap };
   } catch (error) {
     console.error('Error generating embeddings:', error);
     throw error;
@@ -161,69 +180,97 @@ async function findRelevantContent(query, embeddingsDatabase) {
   }
 }
 
+// Function to find HS code by item name
+function findHSCodeByItemName(itemName, itemToHsMap) {
+  const normalizedItemName = itemName.toLowerCase().trim();
+  
+  // Direct match
+  if (itemToHsMap[normalizedItemName]) {
+    return itemToHsMap[normalizedItemName];
+  }
+  
+  // Partial match
+  const itemKeys = Object.keys(itemToHsMap);
+  
+  // Check if item name is contained in any key
+  const containsMatch = itemKeys.find(key => key.includes(normalizedItemName));
+  if (containsMatch) {
+    return itemToHsMap[containsMatch];
+  }
+  
+  // Check if any key is contained in item name
+  const isContainedMatch = itemKeys.find(key => normalizedItemName.includes(key) && key.length > 5);
+  if (isContainedMatch) {
+    return itemToHsMap[isContainedMatch];
+  }
+  
+  return null;
+}
+
 async function checkHSCodeCompliance(hsCode, embeddingsDatabase) {
-    if (embeddingsDatabase.hsCodesData && embeddingsDatabase.hsCodesData[hsCode]) {
-      const hsData = embeddingsDatabase.hsCodesData[hsCode];
-      return {
-        exists: true,
-        allowed: hsData.policy.toLowerCase() === 'free',
-        policy: hsData.policy,
-        description: hsData.description
-      };
-    }
+  if (embeddingsDatabase.hsCodesData && embeddingsDatabase.hsCodesData[hsCode]) {
+    const hsData = embeddingsDatabase.hsCodesData[hsCode];
+    return {
+      exists: true,
+      allowed: hsData.policy.toLowerCase() === 'free',
+      policy: hsData.policy,
+      description: hsData.description
+    };
+  }
+  
+  if (hsCode.length >= 4) {
+    const chapter = hsCode.substring(0, 4);
+    const twoDigitChapter = hsCode.substring(0, 2);
     
-    if (hsCode.length >= 4) {
-      const chapter = hsCode.substring(0, 4);
-      const twoDigitChapter = hsCode.substring(0, 2);
+    const matchingCodes = Object.keys(embeddingsDatabase.hsCodesData || {})
+      .filter(code => code.startsWith(chapter) || code.startsWith(twoDigitChapter));
+    
+    if (matchingCodes.length > 0) {
+      const policies = matchingCodes.map(code => embeddingsDatabase.hsCodesData[code].policy);
       
-      const matchingCodes = Object.keys(embeddingsDatabase.hsCodesData || {})
-        .filter(code => code.startsWith(chapter) || code.startsWith(twoDigitChapter));
-      
-      if (matchingCodes.length > 0) {
-        const policies = matchingCodes.map(code => embeddingsDatabase.hsCodesData[code].policy);
-        
-        if (policies.some(policy => policy.toLowerCase() === 'free')) {
-          return {
-            exists: true,
-            allowed: true,
-            policy: 'Free',
-            description: `Falls under chapter ${chapter} which has some free categories`
-          };
-        } else {
-          return {
-            exists: true,
-            allowed: false,
-            policy: policies[0],
-            description: `Falls under chapter ${chapter} which has no free categories`
-          };
-        }
+      if (policies.some(policy => policy.toLowerCase() === 'free')) {
+        return {
+          exists: true,
+          allowed: true,
+          policy: 'Free',
+          description: `Falls under chapter ${chapter} which has some free categories`
+        };
+      } else {
+        return {
+          exists: true,
+          allowed: false,
+          policy: policies[0],
+          description: `Falls under chapter ${chapter} which has no free categories`
+        };
       }
     }
+  }
+  
+  try {
+    // Use Gemini to generate a reason
+    const prompt = `Given HS code ${hsCode} that wasn't found in our database, provide a reason why this code might not be recognized. Limit your response to one short paragraph.`;
     
-    // Call to Gemini API for dynamic reasoning
-    const dynamicReason = await generateDynamicReason(hsCode);
+    const result = await model.generateContent({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 100 }
+    });
+    
+    const dynamicReason = result.response.text();
     
     return {
       exists: false,
       allowed: false,
       reason: dynamicReason
     };
+  } catch (error) {
+    console.error('Error generating dynamic reason:', error);
+    return {
+      exists: false,
+      allowed: false,
+      reason: `The HS Code ${hsCode} was not found in the export compliance regulations. Please verify the code and try again.`
+    };
   }
-  
-  async function generateDynamicReason(hsCode) {
-    // Example API call to Gemini API
-    const response = await fetch('https://api.gemini.com/generateReason', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ hsCode })
-    });
-    
-    const data = await response.json();3
-    
-    return data.reason || `The HS Code ${hsCode} was not found in the export compliance regulations. Please verify the code and try again.`;
-  }
+}
 
 // Helper function to calculate cosine similarity
 function cosineSimilarity(vecA, vecB) {
@@ -244,27 +291,48 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 // Initialize embeddings database
-let embeddingsDatabase = [];
+let embeddingsDatabase = {
+  chunks: [],
+  hsCodesData: {},
+  itemToHsMap: {}
+};
 
 // API endpoint to check export compliance
 app.post('/api/check-export-compliance', async (req, res) => {
   try {
     const { hsCode, itemWeight, material, itemName, itemManufacturer } = req.body;
     
-    if (!hsCode || !itemWeight || !material || !itemName || !itemManufacturer) {
+    if (!hsCode && !itemName) {
       return res.status(400).json({
         status: false,
-        error: "Missing required fields. Please provide hsCode, itemWeight, material, itemName, and itemManufacturer"
+        error: "Missing required fields. Please provide either hsCode or itemName"
       });
     }
     
-    const hsCodeCompliance = await checkHSCodeCompliance(hsCode, embeddingsDatabase);
+    let codeToCheck = hsCode;
+    
+    // If hsCode is not provided but itemName is, try to find the HS code
+    if (!hsCode && itemName) {
+      codeToCheck = findHSCodeByItemName(itemName, embeddingsDatabase.itemToHsMap);
+      
+      if (!codeToCheck) {
+        return res.json({
+          status: false,
+          allowed: false,
+          reason: `Could not find an HS code matching item name: ${itemName}. Please provide a valid HS code.`
+        });
+      }
+    }
+    
+    const hsCodeCompliance = await checkHSCodeCompliance(codeToCheck, embeddingsDatabase);
     
     if (!hsCodeCompliance.exists) {
       return res.json({
         status: false,
         allowed: false,
-        reason: hsCodeCompliance.reason
+        reason: hsCodeCompliance.reason,
+        queriedHsCode: codeToCheck,
+        queriedItemName: itemName || null
       });
     }
     
@@ -272,17 +340,21 @@ app.post('/api/check-export-compliance', async (req, res) => {
       return res.json({
         status: true,
         allowed: true,
+        hsCode: codeToCheck,
         policy: hsCodeCompliance.policy,
         description: hsCodeCompliance.description,
-        conditions: "Standard export conditions apply"
+        conditions: "Standard export conditions apply",
+        queriedItemName: itemName || null
       });
     } else {
       return res.json({
         status: false,
         allowed: false,
+        hsCode: codeToCheck,
         policy: hsCodeCompliance.policy,
         description: hsCodeCompliance.description,
-        reason: `Export not allowed for HS Code ${hsCode} with policy ${hsCodeCompliance.policy}`
+        reason: `Export not allowed for HS Code ${codeToCheck} with policy ${hsCodeCompliance.policy}`,
+        queriedItemName: itemName || null
       });
     }
     
@@ -294,6 +366,59 @@ app.post('/api/check-export-compliance', async (req, res) => {
     });
   }
 });
+
+app.post('/api/find-by-description', (req, res) => {
+    try {
+      const { description } = req.body;
+      
+      if (!description) {
+        return res.status(400).json({
+          status: false,
+          error: "Missing required field: description"
+        });
+      }
+      
+      const normalizedDescription = description.toLowerCase().trim();
+      
+      // Search through the HS codes data
+      const hsCodesData = embeddingsDatabase.hsCodesData || {};
+      const matchingHsCode = Object.keys(hsCodesData).find(hsCode => 
+        hsCodesData[hsCode].description.toLowerCase() === normalizedDescription
+      );
+      
+      if (matchingHsCode) {
+        return res.json({
+          hsCode: matchingHsCode
+        });
+      }
+      
+      // If no exact match, try partial match
+      const partialMatchHsCode = Object.keys(hsCodesData).find(hsCode => 
+        hsCodesData[hsCode].description.toLowerCase().includes(normalizedDescription) ||
+        normalizedDescription.includes(hsCodesData[hsCode].description.toLowerCase())
+      );
+      
+      if (partialMatchHsCode) {
+        return res.json({
+          status: true,
+          hsCode: partialMatchHsCode,
+          note: "Found via partial match"
+        });
+      }
+      
+      return res.json({
+        status: false,
+        error: "No matching HS code found for this description"
+      });
+      
+    } catch (error) {
+      console.error('Error finding HS code by description:', error);
+      return res.status(500).json({
+        status: false,
+        error: "An error occurred while finding HS code"
+      });
+    }
+  });
 
 // API endpoint to get all HS codes in the database
 app.get('/api/hs-codes', (req, res) => {
@@ -319,6 +444,30 @@ app.get('/api/hs-codes', (req, res) => {
   }
 });
 
+// API endpoint to get item to HS code mapping
+app.get('/api/item-to-hs-mapping', (req, res) => {
+  try {
+    if (!embeddingsDatabase.itemToHsMap) {
+      return res.status(404).json({
+        status: false,
+        error: "Item to HS code mapping not found. Please regenerate embeddings."
+      });
+    }
+    
+    return res.json({
+      status: true,
+      count: Object.keys(embeddingsDatabase.itemToHsMap).length,
+      mapping: embeddingsDatabase.itemToHsMap
+    });
+  } catch (error) {
+    console.error('Error retrieving item to HS mapping:', error);
+    return res.status(500).json({
+      status: false,
+      error: "An error occurred while retrieving item to HS mapping"
+    });
+  }
+});
+
 // Endpoint to force regeneration of embeddings
 app.post('/api/regenerate-embeddings', async (req, res) => {
   try {
@@ -326,13 +475,18 @@ app.post('/api/regenerate-embeddings', async (req, res) => {
       fs.unlinkSync(EMBEDDINGS_PATH);
     }
     
+    if (fs.existsSync(ITEM_TO_HS_PATH)) {
+      fs.unlinkSync(ITEM_TO_HS_PATH);
+    }
+    
     embeddingsDatabase = await generatePdfEmbeddings();
     
     res.json({
       success: true,
-      message: "Embeddings regenerated successfully",
+      message: "Embeddings and item mapping regenerated successfully",
       chunksCount: embeddingsDatabase.chunks.length,
-      hsCodesCount: Object.keys(embeddingsDatabase.hsCodesData || {}).length
+      hsCodesCount: Object.keys(embeddingsDatabase.hsCodesData || {}).length,
+      itemMappingsCount: Object.keys(embeddingsDatabase.itemToHsMap || {}).length
     });
   } catch (error) {
     console.error('Error regenerating embeddings:', error);
@@ -352,6 +506,7 @@ async function initServer() {
       console.log(`Export compliance API server running on port ${port}`);
       console.log(`Loaded ${embeddingsDatabase.chunks?.length || 0} embedded chunks from PDF`);
       console.log(`Extracted ${Object.keys(embeddingsDatabase.hsCodesData || {}).length} HS codes from PDF`);
+      console.log(`Created ${Object.keys(embeddingsDatabase.itemToHsMap || {}).length} item to HS code mappings`);
     });
   } catch (error) {
     console.error('Failed to initialize server:', error);
